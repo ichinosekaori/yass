@@ -9,3 +9,7 @@
 *.aux
 *.log
 *.out
+
+/.vscode
+*.exe
+out.c
