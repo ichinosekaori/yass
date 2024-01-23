@@ -83,13 +83,13 @@
 (define begin->lambda-form
   (lambda (body)
     (if (null? (cdr body))
-        (car body)
+        (convert-sequences (car body))
         (let ((first (car body))
               (rest (cdr body))
               (junk (gensym "junk")))
           `((lambda (,junk)
               ,(begin->lambda-form rest))
-            ,first)))))
+            ,(convert-sequences first))))))
 
 (define convert-sequences
   (lambda (form)
@@ -286,8 +286,9 @@
         (set-union (set-add s (car t)) (cdr t)))))
 
 (define convert-assignments
-  (lambda (e)
-    (let ((assigned (gather-assigned e '())))
+  (lambda (e globals)
+    (let ((assigned (append (cons 'call/cc (gather-assigned e '()))
+                            globals)))
       (letrec ((recurse
                 (lambda (e)
                   (let ((h (car e))
@@ -401,15 +402,14 @@
 
 (define add-primitives
   (lambda (form)
-    `(call (lambda (call/cc exit)
+    `(call (lambda (,(gensym))
              ,form)
-           (lambda (k f)
-             (call (var f)
-                   (lambda (kprime x)
-                     (call (var k) (var x)))
-                   (var k)))
-           (lambda (x)
-             (os-exit (var x))))))
+           (ref-set! (var call/cc)
+                     (lambda (k f)
+                       (call (var f)
+                             (var k)
+                             (lambda (dummy-k result)
+                               (call (var k) (var result)))))))))
 
 ;;; single-argument conversion
 
@@ -558,7 +558,11 @@
              (let* ((body (convert-closures (cadr t) l g))
                     (free (set-minus (gather-free body '())
                                      (car t)))
-                    (freevarlist (map (lambda (v) `(var ,v)) free))
+                    (free (set-minus (set-minus free g)
+                                     (map car (l 'get))))
+                    (freevarlist (map (lambda (v)
+                                        `(var ,v))
+                                      free))
                     (closure-name (gensym "closure"))
                     (new-body (substitute body (make-closing-table free
                                                                    closure-name)))
@@ -605,14 +609,15 @@
 ;;   var if call 
 
 (define c-charsub-table '((#\- . "_")
-                  (#\space . "_space_")
-                  (#\# . "_hash_")
-                  (#\+ . "_plus_")
-                  (#\- . "_minus_")
-                  (#\* . "_ast_")
-                  (#\/ . "_slash_")
-                  (#\? . "_p_")
-                  (#\! . "_bang_")))
+                          (#\space . "_space_")
+                          (#\# . "_hash_")
+                          (#\+ . "_plus_")
+                          (#\- . "_minus_")
+                          (#\* . "_ast_")
+                          (#\/ . "_slash_")
+                          (#\? . "_p_")
+                          (#\! . "_bang_")
+                          (#\% . "_percent_")))
 
 (define sanitize-c-name
   (lambda (name)
@@ -638,7 +643,7 @@
   (lambda (s)
     (if (gensym? s)
         (string-append "g_"
-                       (symbol->string s)
+                       (sanitize-c-name (symbol->string s))
                        "_"
                        (sanitize-c-name (gensym->unique-string s)))
         (string-append "s_"
@@ -680,7 +685,7 @@
                (string-append "intern(make_ptr_ptr((ptr_t[]){"
                               "make_ptr_int("
                               (number->string len)
-                              ", 3)"
+                              ", 2)"
                               (apply string-append
                                      (map (lambda (char)
                                             (string-append ", make_ptr_int("
@@ -694,7 +699,7 @@
                (string-append "make_ptr_ptr((ptr_t[]){"
                               "make_ptr_int("
                               (number->string len)
-                              ", 3)"
+                              ", 2)"
                               (apply string-append
                                      (map (lambda (char)
                                             (string-append ", make_ptr_int("
@@ -708,25 +713,25 @@
                             (number->string e)
                             ", T_NUM)"))
             ((real? e)
-             (string-append "make_flonum("
+             (string-append "make_ptr_ptr((ptr_t[]){make_ptr_int(2, 0), bitrep("
                             (number->string e)
-                            ")"))
+                            ")}, T_HEAP)"))
             ((char? e)
              (string-append "make_ptr_int("
                             (number->string (char->integer e))
                             ", T_CHAR)"))
             ((vector? e)
              (let ((len (vector-length e)))
-               (string-append "((ptr_t[]){"
+               (string-append "make_ptr_ptr((ptr_t[]){"
                               "make_ptr_int("
                               (number->string len)
-                              ", 4)"
+                              ", 3)"
                               (apply string-append
                                      (map (lambda (e)
                                             (string-append ", "
                                                            (rec e)))
                                           (vector->list e)))
-                              "})")))
+                              "}, T_HEAP)")))
             (else
              (error "object not embeddable"))))))
 
@@ -769,7 +774,7 @@
                                                        (c-name v-var)
                                                        ", 0, make_ptr_int("
                                                        (number->string len)
-                                                       ", 4))")))
+                                                       ", 3))")))
                (letrec ((iter
                          (lambda (l i)
                            (if (null? l)
@@ -822,13 +827,13 @@
                             ")"))))))
 
 (define gen-check-gc
-  (lambda (f)
-    (let* ((formals (caddr f))
+  (lambda (f g)
+    (let* ((formals (append (caddr f) g))
            (body (cadddr f))
            (max-alloc-size (max-alloc body)))
-      (string-append "if (alloc + "
+      (string-append "if (always_gc || alloc + "
                      (number->string max-alloc-size)
-                     " > fromspace + heap_size) { start_gc(); "
+                     " >= fromspace + heap_size) { start_gc(); "
                      (apply string-append
                             (map (lambda (var)
                                    (let ((name (c-name var)))
@@ -887,8 +892,8 @@
                                      (let* ((letlist (make-pushlist))
                                             (res (c-body (cadddr func) constlist letlist)))
                                        (string-append (signature func)
-                                                      " { "
-                                                      (gen-check-gc func)
+                                                      " { runcnt++; "
+                                                      (gen-check-gc func globals)
                                                       (apply string-append
                                                              (map (lambda (l)
                                                                     (let ((var (car l))
@@ -911,8 +916,7 @@
                                                      (c-name p)
                                                      "; "))
                                     (append (map car (constlist 'get))
-                                            globals
-                                            '(call/cc)))))
+                                            globals))))
            (const-assignments (apply string-append
                                     (map (lambda (p)
                                            (let ((name (car p))
@@ -937,6 +941,21 @@
                 "// DECLS //"                       
                 (string-append const-decls funcs)))))
 
+(define ast->scheme
+  (lambda (e)
+    (let ((h (car e)))
+      (cond ((eq? h 'var)
+             (cadr e))
+            ((eq? h 'quote)
+             e)
+            ((eq? h 'lambda)
+             `(lambda ,(cadr e)
+                ,(ast->scheme (caddr e))))
+            ((eq? h 'call)
+             (map ast->scheme (cdr e)))
+            (else
+             (cons h (map ast->scheme (cdr e))))))))
+
 ;;; driver
 
 (define compile
@@ -945,25 +964,34 @@
            (program (expand-macros program))
            (program (splice-defs program))
            (program (map convert-sequences program))
-           (globals (collect-globals program 'define))
+           (globals (cons 'call/cc (collect-globals program 'define)))
            (syntaxes (collect-globals program 'define-syntax))
            (program (convert-definitions program))
            (asts (map scheme->ast program))
-           (junk (map (lambda (e) (check e safe)) asts))
            (renamed (map (lambda (e) (rename-vars e '())) asts))
            (renamed (append renamed '('0)))
            (single-form (begin->lambda renamed))
-           (assignless (convert-assignments single-form))
-           (cpsed (cps-c assignless '(var exit)))
+           (assignless (convert-assignments single-form globals))
+           (res-sym (gensym "res"))
+           (cpsed (cps-c assignless `(lambda (,res-sym) (os-exit (var ,res-sym)))))
            (cpsed (add-primitives cpsed))
+                                        ;(cpsed (rename-vars cpsed '()))
            (known-adic (convert-arguments cpsed))
            (l (make-pushlist))
            (closed (convert-closures known-adic l globals))
            (entrypoint (gensym "main"))
            (template (read-file "program.c")))
       (l 'push (cons entrypoint `(lambda () ,closed)))
-      ;(pretty-print (l 'get))
+                                        ;(pretty-print program)
+                                        ;(pretty-print program)
+                                        ;(pretty-print (ast->scheme cpsed))
+                                        ;(pretty-print (car (l 'get)))
+                                        ;(pretty-print (map car (l 'get)))
       (generate-c (l 'get) entrypoint template globals))))
+
+(define compile-into-file
+  (lambda (program fn)
+    (write-file fn (compile program))))
 
 (define programs
   '(((define id (lambda (x) x))
@@ -974,3 +1002,38 @@
        (lambda (x) (cadr x)))
      (define list (lambda x x))
      (id (list (lambda (x) x) (lambda (x) x) (lambda (x) x))))))
+
+(define tco-test
+  '((define exit
+      (lambda (x)
+        (%primitive os-exit x)))
+    (define pc
+      (lambda (c)
+        (%primitive putchar c)))
+    (define yes
+      (lambda ()
+        (pc #\y)
+        (yes)))
+    (yes)))
+
+(define cont-test
+  '(((lambda (pc reta)
+       (pc (reta)))
+     (lambda (c)
+       (%primitive putchar c))
+     (lambda ()
+       (call/cc (lambda (return)
+                  (return #\a)
+                  #\b))))))
+
+(define yinyang
+  '((define pc
+      (lambda (c)
+        (%primitive putchar c)))
+    ((lambda (yin)
+       ((lambda (yang)
+          (yin yang))
+        ((lambda (x) (pc #\b) x)
+         (call/cc (lambda (x) x)))))
+     ((lambda (x) (pc #\a) x)
+      (call/cc (lambda (x) x))))))
